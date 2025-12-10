@@ -1,6 +1,7 @@
 
-use crate::features::mean_std;
 
+use crate::features::mean_std;
+use crate::advanced::{hmm_infer_state, VolState}; // add this
 #[derive(Debug, Copy, Clone)]
 pub enum MarketRegime {
     TrendingUp,
@@ -14,18 +15,54 @@ pub fn dot(a: &[f64], b: &[f64]) -> f64 {
 }
 
 pub fn classify_regime_ml(pred_ret: f64, pred_vol: f64, returns: &[f64]) -> MarketRegime {
-    let look = returns.len().min(80);
-    let (_, vol_realized) = mean_std(&returns[returns.len() - look..]);
+    use crate::advanced::{hmm_infer_state, VolState};
+    use crate::features::mean_std;
 
+    // Realized volatility window
+    let look = returns.len().min(80);
+    let (_, vol_realized) = mean_std(&returns[returns.len().saturating_sub(look)..]);
+
+    // Clamp directional signal into {-1, 0, 1}
     let pv = pred_vol.max(1e-4);
-    if pred_ret > 1.5 * pv {
-        MarketRegime::TrendingUp
+    let raw_dir = if pred_ret > 1.5 * pv {
+        1
     } else if pred_ret < -1.5 * pv {
-        MarketRegime::TrendingDown
-    } else if vol_realized > 0.015 {
-        MarketRegime::SidewaysHighVol
+        -1
     } else {
-        MarketRegime::SidewaysLowVol
+        0
+    };
+
+    // HMM-lite vol state
+    let state = hmm_infer_state(returns);
+
+    match (state, raw_dir) {
+        // HIGH VOL
+        (VolState::High, 1)  => MarketRegime::TrendingUp,
+        (VolState::High, -1) => MarketRegime::TrendingDown,
+        (VolState::High, 0)  => MarketRegime::SidewaysHighVol,
+
+        // MEDIUM VOL
+        (VolState::Medium, 1)  => MarketRegime::TrendingUp,
+        (VolState::Medium, -1) => MarketRegime::TrendingDown,
+        (VolState::Medium, 0) => {
+            if vol_realized > 0.015 {
+                MarketRegime::SidewaysHighVol
+            } else {
+                MarketRegime::SidewaysLowVol
+            }
+        }
+
+        // LOW VOL (anything else)
+        (VolState::Low, _) => {
+            if vol_realized > 0.015 {
+                MarketRegime::SidewaysHighVol
+            } else {
+                MarketRegime::SidewaysLowVol
+            }
+        }
+
+        // FULL FALLBACK — satisfies Rust's exhaustiveness rules
+        _ => MarketRegime::SidewaysLowVol,
     }
 }
 

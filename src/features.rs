@@ -1,7 +1,10 @@
 
-use crate::data::MarketBar;
+// src/features.rs
 
-/// sample mean + sample std
+use crate::data::MarketBar;
+use crate::advanced::fit_garch_mle_and_series;
+
+/// mean + std
 pub fn mean_std(data: &[f64]) -> (f64, f64) {
     if data.is_empty() {
         return (0.0, 0.0);
@@ -12,6 +15,7 @@ pub fn mean_std(data: &[f64]) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
+/// Log returns
 pub fn compute_log_returns(bars: &[MarketBar]) -> Vec<f64> {
     let mut out = Vec::with_capacity(bars.len().saturating_sub(1));
     for i in 1..bars.len() {
@@ -26,27 +30,16 @@ pub fn compute_log_returns(bars: &[MarketBar]) -> Vec<f64> {
     out
 }
 
+/// NEW: Calls advanced GARCH MLE
 pub fn compute_garch_like_vol(returns: &[f64]) -> Vec<f64> {
     if returns.is_empty() {
         return vec![];
     }
-
-    let (mean_r, var_r) = mean_std(returns);
-    let mut sigma2 = var_r.max(1e-8);
-
-    const OMEGA: f64 = 1e-7;
-    const ALPHA: f64 = 0.1;
-    const BETA: f64 = 0.85;
-
-    let mut out = Vec::with_capacity(returns.len());
-    for &r in returns {
-        sigma2 = OMEGA + ALPHA * (r - mean_r).powi(2) + BETA * sigma2;
-        out.push(sigma2.sqrt());
-    }
-    out
+    let (_params, series) = fit_garch_mle_and_series(returns);
+    series
 }
 
-/// Build ML features (unchanged structure)
+/// Build ML dataset
 pub fn build_ml_dataset(
     bars: &[MarketBar],
     returns: &[f64],
@@ -61,8 +54,9 @@ pub fn build_ml_dataset(
 
     let volumes: Vec<f64> = bars.iter().map(|b| b.volume).collect();
     let trades: Vec<f64> = bars.iter().map(|b| b.trades).collect();
-    let (_vm, vstd) = mean_std(&volumes);
-    let (_tm, tstd) = mean_std(&trades);
+
+    let (vm, vstd) = mean_std(&volumes);
+    let (tm, tstd) = mean_std(&trades);
 
     let mut feats = Vec::new();
     let mut targs = Vec::new();
@@ -83,11 +77,8 @@ pub fn build_ml_dataset(
         let (_, vol5) = mean_std(r_s);
         let (_, vol20) = mean_std(r_l);
 
-        let vol_z =
-            if vstd > 0.0 { (bars[end].volume - volumes.iter().sum::<f64>() / volumes.len() as f64) / vstd } else { 0.0 };
-
-        let trades_z =
-            if tstd > 0.0 { (bars[end].trades - trades.iter().sum::<f64>() / trades.len() as f64) / tstd } else { 0.0 };
+        let vol_z = if vstd > 0.0 { (bars[end].volume - vm) / vstd } else { 0.0 };
+        let trades_z = if tstd > 0.0 { (bars[end].trades - tm) / tstd } else { 0.0 };
 
         let range = if bars[end].close > 0.0 {
             (bars[end].high - bars[end].low).abs() / bars[end].close
@@ -102,4 +93,9 @@ pub fn build_ml_dataset(
     }
 
     (feats, targs)
+}
+
+/// Dot product
+pub fn mean(a: &[f64]) -> f64 {
+    a.iter().sum::<f64>() / (a.len() as f64)
 }
