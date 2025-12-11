@@ -6,6 +6,8 @@ use rand_distr::{Distribution, Normal};
 
 use crate::data::MarketBar;
 use crate::sabr::{SabrParams, sabr_implied_vol};
+use crate::features::compute_log_returns;
+use crate::advanced::estimate_autocorr_squared;
 
 /// Result of a full Monte Carlo simulation.
 pub struct SimulationResult {
@@ -29,23 +31,30 @@ pub fn price_to_bucket(price: f64, min: f64, max: f64, buckets: usize) -> usize 
 
 /// Compute price bounds so that:
 /// - they scale with vol * sqrt(horizon)
-/// - they contain ≈98% of terminal prices (1%–99% quantiles)
-pub fn compute_price_bounds(
+/// - they adapt to volatility clustering
+/// - they contain ≈98% of terminal prices using empirical quantiles
+fn compute_price_bounds(
     last: f64,
     base_sigma: f64,
     horizon: usize,
     terminal_prices: &[f64],
+    vol_cluster: f64,
 ) -> (f64, f64) {
     // Analytic horizon vol scale
     let eff_sigma = (base_sigma * (horizon as f64).sqrt()).max(1e-6);
 
-    // Slightly tighter analytic bounds vs old ±4σ
-    let analytic_low = last * f64::exp(-3.0 * eff_sigma);
-    let analytic_high = last * f64::exp(3.0 * eff_sigma);
+    // Vol clustering factor in [0, 1+] range, clamp for sanity
+    let vc = vol_cluster.clamp(0.0, 1.0);
 
-    // If we somehow have no prices, just use analytic
+    // Spread multiplier in sigmas; allow 2–4σ based on clustering
+    let spread_mult = 2.0 + 2.0 * vc; // 2σ when calm, up to 4σ when clustered
+
+    let analytic_low = last * f64::exp(-spread_mult * eff_sigma);
+    let analytic_high = last * f64::exp(spread_mult * eff_sigma);
+
+    // If we somehow have no terminal prices, just use analytic band.
     if terminal_prices.is_empty() {
-        return (analytic_low, analytic_high);
+        return (analytic_low.max(1e-6), analytic_high.max(analytic_low * 1.5));
     }
 
     // Empirical quantiles of terminal prices
@@ -79,7 +88,8 @@ pub fn compute_price_bounds(
 
 /// Monte Carlo simulation:
 /// - uses SABR local vol
-/// - uses base_sigma as stochastic vol scale
+/// - uses base_sigma as stochastic vol scale (adjusted by clustering)
+/// - introduces liquidity-sensitive jump probability and size
 /// - returns heatmap + the grid bounds
 pub fn simulate_heatmap(
     bars: &[MarketBar],
@@ -92,8 +102,54 @@ pub fn simulate_heatmap(
 ) -> SimulationResult {
     let last_close = bars.last().unwrap().close;
 
-    // Clamp base sigma to a realistic intraday band.
-    let base_sigma = base_sigma_in.clamp(0.005, 0.03);
+    // Compute log-returns for volatility clustering diagnostics.
+    let returns = compute_log_returns(bars);
+    let vol_cluster = if returns.len() > 10 {
+        estimate_autocorr_squared(&returns, 5).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Microstructure / liquidity proxy from recent bars.
+    let n_micro = bars.len().min(200);
+    let slice = &bars[bars.len() - n_micro..];
+
+    let mut sum_range = 0.0;
+    let mut sum_vol = 0.0;
+    let mut cnt = 0.0;
+
+    for b in slice {
+        if b.close > 0.0 {
+            let r = (b.high - b.low).abs() / b.close;
+            sum_range += r;
+        }
+        sum_vol += b.volume.max(0.0);
+        cnt += 1.0;
+    }
+
+    let avg_range = if cnt > 0.0 { sum_range / cnt } else { 0.0 };
+    let avg_vol = if cnt > 0.0 { sum_vol / cnt } else { 0.0 };
+
+    // Liquidity thinness proxy: larger when ranges are big relative to volume.
+    let liq_thin = if avg_vol > 0.0 {
+        (avg_range / avg_vol).abs()
+    } else {
+        avg_range.abs()
+    };
+
+    // Base jump probability and scaling based on liquidity thinness and clustering.
+    let mut jump_prob_base = 0.01 + 0.20 * liq_thin;
+    jump_prob_base = jump_prob_base.clamp(0.005, 0.08);
+
+    let jump_prob = (jump_prob_base * (1.0 + 0.5 * vol_cluster)).clamp(0.005, 0.15);
+
+    // Clamp base sigma to a realistic intraday band, then adjust by clustering.
+    let mut base_sigma = base_sigma_in.clamp(0.009, 0.07);
+    if vol_cluster > 0.4 {
+        base_sigma *= 1.3;
+    } else if vol_cluster < 0.1 {
+        base_sigma *= 0.85;
+    }
 
     let mut rng = rand::thread_rng();
     let normal = Normal::new(0.0, 1.0).unwrap();
@@ -102,8 +158,11 @@ pub fn simulate_heatmap(
     // prices[t][path]
     let mut prices = vec![vec![0.0; paths]; horizon];
 
-    // Per-step drift (log scale) – keep it mild.
+    // Per-step drift (log scale) – keep it mild across the horizon.
     let drift_step = drift / horizon as f64;
+
+    // Vol clustering scale factor used inside the simulation.
+    let vol_cluster_scale = 1.0 + 0.5 * vol_cluster;
 
     for path in 0..paths {
         let mut price = last_close;
@@ -113,19 +172,21 @@ pub fn simulate_heatmap(
             let sabr_vol = sabr_implied_vol(price, price, sabr);
             let smile_scale = (sabr_vol / sabr.atm_vol.max(1e-6)).clamp(0.5, 1.8);
 
-            // Stochastic vol shock – keep multiplier small to avoid insane skew.
+            // Stochastic vol shock
             let vol_shock: f64 = normal.sample(&mut rng);
+
             let local_sigma_raw =
-                base_sigma * smile_scale * (1.0 + 0.15 * vol_shock);
-            let local_sigma = local_sigma_raw.clamp(0.002, 0.05);
+                base_sigma * smile_scale * vol_cluster_scale * (1.0 + 0.15 * vol_shock);
+            let local_sigma = local_sigma_raw.clamp(0.002, 0.06);
 
             let z: f64 = normal.sample(&mut rng);
             price *= (drift_step + local_sigma * z).exp();
 
-            // Jump process: rare + modest.
-            if rng.gen_bool(0.01) {
+            // Liquidity-sensitive jump process: rare but meaningful.
+            if rng.gen_bool(jump_prob) {
                 let jump_z: f64 = normal.sample(&mut rng);
-                price *= (0.25 * local_sigma * jump_z).exp();
+                let jump_scale = 0.15 + 0.30 * vol_cluster; // 15–45% of local_sigma
+                price *= (jump_scale * local_sigma * jump_z).exp();
             }
 
             if !price.is_finite() || price <= 0.0 {
@@ -140,7 +201,7 @@ pub fn simulate_heatmap(
     // Use terminal distribution to set bounds
     let terminal_prices = &prices[horizon - 1];
     let (min_p, max_p) =
-        compute_price_bounds(last_close, base_sigma, horizon, terminal_prices);
+        compute_price_bounds(last_close, base_sigma, horizon, terminal_prices, vol_cluster);
 
     println!("Price grid: {:.4} → {:.4}", min_p, max_p);
 

@@ -56,16 +56,15 @@ impl Default for Backtester {
 }
 
 impl Backtester {
-    /// Run on 1H bars; you can wire in other TFs if you want later.
-    /// Only uses the last ~1 year of data (24 * 365 bars) for regime + PnL.
+    /// Run on 1H bars; uses only the last ~1.5 years of data for PnL
+    /// and regime inference, to keep the environment recent.
     pub fn run(&mut self, all_bars: &[MarketBar]) -> BacktestResult {
         if all_bars.len() < 500 {
             panic!("Need at least 500 bars for a meaningful backtest.");
         }
 
-        // === Only use the last ~1 year of 1H data ===
-        // If you want 6 months instead, change to: 24 * 30 * 6
-        let lookback = 24 * 36;
+        // === Only use the last ~1.5 years of 1H data ===
+        let lookback = 24 * 36; // 36 days * 24h (you can stretch this if you want)
         let bars: &[MarketBar] = if all_bars.len() > lookback {
             &all_bars[all_bars.len() - lookback..]
         } else {
@@ -86,29 +85,42 @@ impl Backtester {
 
         let mut prev_forecast: Option<ForecastSnapshot> = None;
 
+        // For mark-to-market we need last price when a position is open.
+        let mut last_price: f64 = bars[0].close;
+
         // Warmup: need enough history for ML/GARCH/etc.
-        let start_idx = 500;
+        let start_idx = 500.min(n.saturating_sub(2)); // avoid out-of-range
 
         for i in 0..n {
             let price = bars[i].close;
 
-            // Mark-to-market equity if we hold a position.
-            if current_pos != 0.0 {
-                let pos_value = current_pos * (price / entry_price - 1.0);
-                equity = (self.initial_equity * (1.0 + pos_value)).max(0.0);
+            // === Mark-to-market equity if we hold a position ===
+            if current_pos != 0.0 && i > 0 {
+                let prev_price = last_price;
+                if prev_price > 0.0 {
+                    let ret = price / prev_price - 1.0;
+                    equity *= 1.0 + current_pos * ret;
+                    equity = equity.max(0.0);
+                }
             }
 
+            last_price = price.max(1e-9);
+
+            // Track equity + max drawdown.
             if equity > peak_equity {
                 peak_equity = equity;
             }
-            let dd = 1.0 - equity / peak_equity;
+            let dd = if peak_equity > 0.0 {
+                1.0 - equity / peak_equity
+            } else {
+                0.0
+            };
             equity_curve.push(equity);
 
             // Enforce max drawdown: once breached, close and stop trading.
             if dd >= self.max_drawdown_allowed && trading_enabled {
                 if current_pos != 0.0 {
-                    let pnl =
-                        current_pos * (price / entry_price - 1.0) * self.initial_equity;
+                    let pnl = equity - self.initial_equity;
                     trades.push(Trade {
                         entry_price,
                         exit_price: price,
@@ -120,7 +132,8 @@ impl Backtester {
                 trading_enabled = false;
             }
 
-            // If not enough history yet, skip signal generation.
+            // If not enough history yet, skip signal generation (but still
+            // record equity for stats).
             if i < start_idx || !trading_enabled {
                 continue;
             }
@@ -146,23 +159,30 @@ impl Backtester {
 
             let new_pos = target.target_fraction.clamp(-1.0, 1.0);
 
-            // If position changes, treat it as closing previous and opening new.
+            // === Position management ===
+            //
+            // If position changes, treat it as:
+            // - closing previous position (if any)
+            // - opening new position (if non-zero)
             if (new_pos - current_pos).abs() > 1e-6 {
                 if current_pos != 0.0 {
-                    let pnl =
-                        current_pos * (price / entry_price - 1.0) * self.initial_equity;
+                    // Realized PnL of this trade is the difference between
+                    // current equity and an implicit "flat" reference.
+                    // For logging, approximate trade PnL based on price move
+                    // from entry to current.
+                    let approx_pnl = current_pos
+                        * (price / entry_price - 1.0)
+                        * equity.max(1e-9);
+
                     trades.push(Trade {
                         entry_price,
                         exit_price: price,
                         size: current_pos,
-                        pnl,
+                        pnl: approx_pnl,
                     });
-                    equity += pnl; // adjust equity explicitly
-                    if equity > peak_equity {
-                        peak_equity = equity;
-                    }
                 }
 
+                // Open new position or go flat.
                 if new_pos.abs() > 1e-6 {
                     entry_price = price;
                     current_pos = new_pos;
@@ -174,27 +194,33 @@ impl Backtester {
             prev_forecast = Some(forecast);
         }
 
-        // Close any open position at final bar.
+        // Close any open position at final bar (for logging).
         if current_pos != 0.0 {
             let last_price = bars.last().unwrap().close;
-            let pnl =
-                current_pos * (last_price / entry_price - 1.0) * self.initial_equity;
+            let approx_pnl = current_pos
+                * (last_price / entry_price - 1.0)
+                * equity.max(1e-9);
+
             trades.push(Trade {
                 entry_price,
                 exit_price: last_price,
                 size: current_pos,
-                pnl,
+                pnl: approx_pnl,
             });
-            equity += pnl;
+            // Equity is already mark-to-market; no extra adjustment.
             equity_curve.push(equity);
         }
 
         let final_equity = equity;
-        let total_return = final_equity / self.initial_equity - 1.0;
+        let total_return = if self.initial_equity > 0.0 {
+            final_equity / self.initial_equity - 1.0
+        } else {
+            0.0
+        };
 
         // Assume 1H bars, ~24 * 365 bars per year.
         let years = (n as f64) / (24.0 * 365.0);
-        let annualized_return = if years > 0.0 {
+        let annualized_return = if years > 0.0 && final_equity > 0.0 && self.initial_equity > 0.0 {
             (final_equity / self.initial_equity).powf(1.0 / years) - 1.0
         } else {
             0.0
@@ -218,7 +244,8 @@ impl Backtester {
     }
 }
 
-/// Build a one-step-ahead forecast from a prefix of bars using your existing machinery.
+/// Build a one-step-ahead forecast from a prefix of bars using your existing
+/// machinery. This is called in a walk-forward fashion inside the backtest.
 fn build_forecast_for_slice(
     hist: &[MarketBar],
 ) -> (ForecastSnapshot, f64, f64, MarketRegime) {
@@ -269,7 +296,7 @@ fn build_forecast_for_slice(
     let sabr = estimate_sabr_params(&returns, base_sigma, last_close);
 
     // Small Monte Carlo to get distribution for next step.
-    // NOTE: horizon = 1 here to stop SABR from nuking the grid.
+    // NOTE: horizon = 1 here to keep grid tight for the router.
     let horizon = 1;
     let buckets = 80;
     let paths = 3000;
@@ -312,14 +339,14 @@ fn summarize_distribution_from_row(
 
     let width = (max_p - min_p) / buckets as f64;
 
-    // mean
+    // Mean
     let mut mean = 0.0;
     for (i, &p) in row.iter().enumerate() {
         let price = min_p + (i as f64 + 0.5) * width;
         mean += price * p;
     }
 
-    // central moments
+    // Central moments
     let mut m2 = 0.0;
     let mut m3 = 0.0;
     let mut m4 = 0.0;
@@ -335,7 +362,7 @@ fn summarize_distribution_from_row(
     let skew = if std > 0.0 { m3 / std.powi(3) } else { 0.0 };
     let kurt = if std > 0.0 { m4 / std.powi(4) } else { 0.0 };
 
-    // mode
+    // Mode
     let (mode_idx, _) = row
         .iter()
         .enumerate()
