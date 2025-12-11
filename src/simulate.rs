@@ -7,13 +7,14 @@ use rand_distr::{Distribution, Normal};
 use crate::data::MarketBar;
 use crate::sabr::{SabrParams, sabr_implied_vol};
 
+/// Result of a full Monte Carlo simulation.
 pub struct SimulationResult {
     pub heatmap: Vec<Vec<f64>>,
     pub min_price: f64,
     pub max_price: f64,
 }
 
-/// Convert price → bucket index
+/// Map price → bucket index within [min, max].
 pub fn price_to_bucket(price: f64, min: f64, max: f64, buckets: usize) -> usize {
     if price <= min {
         return 0;
@@ -26,34 +27,48 @@ pub fn price_to_bucket(price: f64, min: f64, max: f64, buckets: usize) -> usize 
     idx.clamp(0, buckets as isize - 1) as usize
 }
 
-/// Compute min/max using analytic + empirical quantiles
+/// Compute price bounds so that:
+/// - they scale with vol * sqrt(horizon)
+/// - they contain ≈98% of terminal prices (1%–99% quantiles)
 pub fn compute_price_bounds(
     last: f64,
     base_sigma: f64,
     horizon: usize,
     terminal_prices: &[f64],
 ) -> (f64, f64) {
+    // Analytic horizon vol scale
     let eff_sigma = (base_sigma * (horizon as f64).sqrt()).max(1e-6);
 
-    let analytic_low = last * f64::exp(-4.0 * eff_sigma);
-    let analytic_high = last * f64::exp(4.0 * eff_sigma);
+    // Slightly tighter analytic bounds vs old ±4σ
+    let analytic_low = last * f64::exp(-3.0 * eff_sigma);
+    let analytic_high = last * f64::exp(3.0 * eff_sigma);
 
+    // If we somehow have no prices, just use analytic
     if terminal_prices.is_empty() {
         return (analytic_low, analytic_high);
     }
 
+    // Empirical quantiles of terminal prices
     let mut v = terminal_prices.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let n = v.len();
-    let low = v[(0.01 * n as f64) as usize];
-    let high = v[(0.99 * n as f64) as usize];
+    let idx_low = ((0.01 * n as f64).floor() as usize).min(n - 1);
+    let idx_high = ((0.99 * n as f64).ceil() as usize).min(n - 1);
 
-    let mut min_p = low.min(analytic_low) * 0.98;
-    let mut max_p = high.max(analytic_high) * 1.02;
+    let q_low = v[idx_low].max(1e-6);
+    let q_high = v[idx_high];
+
+    // Combine analytic + empirical:
+    let mut min_p = q_low.min(analytic_low);
+    let mut max_p = q_high.max(analytic_high);
+
+    // Pad a bit so edges are not saturated
+    min_p *= 0.99;
+    max_p *= 1.01;
 
     if min_p <= 0.0 {
-        min_p = analytic_low.max(1e-6);
+        min_p = analytic_low.min(last * 0.5).max(1e-6);
     }
     if max_p <= min_p {
         max_p = min_p * 1.5;
@@ -62,11 +77,14 @@ pub fn compute_price_bounds(
     (min_p, max_p)
 }
 
-/// Full Monte Carlo (Bates + Heston + SABR smile)
+/// Monte Carlo simulation:
+/// - uses SABR local vol
+/// - uses base_sigma as stochastic vol scale
+/// - returns heatmap + the grid bounds
 pub fn simulate_heatmap(
     bars: &[MarketBar],
     drift: f64,
-    base_sigma: f64,
+    base_sigma_in: f64,
     sabr: &SabrParams,
     horizon: usize,
     buckets: usize,
@@ -74,74 +92,77 @@ pub fn simulate_heatmap(
 ) -> SimulationResult {
     let last_close = bars.last().unwrap().close;
 
+    // Clamp base sigma to a realistic intraday band.
+    let base_sigma = base_sigma_in.clamp(0.005, 0.03);
+
     let mut rng = rand::thread_rng();
     let normal = Normal::new(0.0, 1.0).unwrap();
 
+    // Store all simulated prices for rebucketing later:
+    // prices[t][path]
     let mut prices = vec![vec![0.0; paths]; horizon];
 
-    // === Heston parameters ===
-    let v0 = (base_sigma * base_sigma).max(1e-6);
-    let theta = v0;
-    let kappa = 2.0;
-    let xi = (base_sigma * 1.5).max(0.05);
-    let rho = sabr.rho.clamp(-0.8, 0.8);
-
-    let dt = 1.0 / horizon.max(1) as f64;
-    let sqrt_dt = dt.sqrt();
+    // Per-step drift (log scale) – keep it mild.
+    let drift_step = drift / horizon as f64;
 
     for path in 0..paths {
         let mut price = last_close;
-        let mut v = v0;
 
         for t in 0..horizon {
+            // SABR local vol: use F = K = price (ATM smile at current level)
             let sabr_vol = sabr_implied_vol(price, price, sabr);
-            let smile = (sabr_vol / sabr.atm_vol).clamp(0.5, 2.0);
+            let smile_scale = (sabr_vol / sabr.atm_vol.max(1e-6)).clamp(0.5, 1.8);
 
-            let z1: f64 = normal.sample(&mut rng);
-            let z2: f64 = normal.sample(&mut rng);
+            // Stochastic vol shock – keep multiplier small to avoid insane skew.
+            let vol_shock: f64 = normal.sample(&mut rng);
+            let local_sigma_raw =
+                base_sigma * smile_scale * (1.0 + 0.15 * vol_shock);
+            let local_sigma = local_sigma_raw.clamp(0.002, 0.05);
 
-            let z_v = z2;
-            let z_p = rho * z2 + (1.0 - rho * rho).sqrt() * z1;
+            let z: f64 = normal.sample(&mut rng);
+            price *= (drift_step + local_sigma * z).exp();
 
-            v = (v + kappa * (theta - v) * dt + xi * v.sqrt() * sqrt_dt * z_v)
-                .max(1e-8);
-
-            let local_sigma = (v.sqrt() * smile).max(0.001);
-
-            let drift_step = drift / horizon as f64;
-            price *= (drift_step + local_sigma * z_p).exp();
-
-            // Bates jumps
-            if rng.gen_bool(0.02) {
+            // Jump process: rare + modest.
+            if rng.gen_bool(0.01) {
                 let jump_z: f64 = normal.sample(&mut rng);
-                price *= (0.7 * local_sigma * jump_z).exp();
+                price *= (0.25 * local_sigma * jump_z).exp();
             }
 
             if !price.is_finite() || price <= 0.0 {
+                // If something explodes, reset to last_close (very rare).
                 price = last_close;
-                v = v0;
             }
 
             prices[t][path] = price;
         }
     }
 
-    let terminal = &prices[horizon - 1];
-    let (min_p, max_p) = compute_price_bounds(last_close, base_sigma, horizon, terminal);
+    // Use terminal distribution to set bounds
+    let terminal_prices = &prices[horizon - 1];
+    let (min_p, max_p) =
+        compute_price_bounds(last_close, base_sigma, horizon, terminal_prices);
 
     println!("Price grid: {:.4} → {:.4}", min_p, max_p);
 
+    // Build heatmap under the chosen bounds
     let mut heatmap = vec![vec![0.0; buckets]; horizon];
 
     for t in 0..horizon {
-        for &price in &prices[t] {
-            let b = price_to_bucket(price, min_p, max_p, buckets);
-            heatmap[t][b] += 1.0;
+        let row_prices = &prices[t];
+        let row = &mut heatmap[t];
+
+        for &price in row_prices {
+            if price > 0.0 && price.is_finite() {
+                let b = price_to_bucket(price, min_p, max_p, buckets);
+                row[b] += 1.0;
+            }
         }
-        let sum: f64 = heatmap[t].iter().sum();
-        if sum > 0.0 {
-            for p in heatmap[t].iter_mut() {
-                *p /= sum;
+
+        // Normalize row to sum to 1
+        let s: f64 = row.iter().sum();
+        if s > 0.0 {
+            for v in row.iter_mut() {
+                *v /= s;
             }
         }
     }

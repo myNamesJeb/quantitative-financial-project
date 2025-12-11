@@ -3,14 +3,21 @@
 
 use crate::data::MarketBar;
 use crate::features::{
-    build_ml_dataset, classify_regime_ml, compute_garch_like_vol, compute_log_returns,
-    fit_linear_regression_ensemble, mean_std, MarketRegime,
+    build_ml_dataset,
+    compute_garch_like_vol,
+    compute_log_returns,
+    mean_std,
+};
+use crate::ml::{
+    classify_regime_ml,
+    fit_linear_regression_ensemble,
+    dot,
+    MarketRegime,
 };
 use crate::drift::compute_drift_and_vol_scale;
-use crate::sabr::{estimate_sabr_params, SabrParams};
-use crate::simulate::{compute_price_bounds, simulate_heatmap};
+use crate::sabr::estimate_sabr_params;
+use crate::simulate::simulate_heatmap;
 use crate::strategy::{Context, ForecastSnapshot, StrategyRouter};
-use crate::viz::summarize_distribution_extended;
 
 #[derive(Debug)]
 pub struct Trade {
@@ -50,11 +57,22 @@ impl Default for Backtester {
 
 impl Backtester {
     /// Run on 1H bars; you can wire in other TFs if you want later.
-    pub fn run(&mut self, bars: &[MarketBar]) -> BacktestResult {
-        let n = bars.len();
-        if n < 500 {
+    /// Only uses the last ~1 year of data (24 * 365 bars) for regime + PnL.
+    pub fn run(&mut self, all_bars: &[MarketBar]) -> BacktestResult {
+        if all_bars.len() < 500 {
             panic!("Need at least 500 bars for a meaningful backtest.");
         }
+
+        // === Only use the last ~1 year of 1H data ===
+        // If you want 6 months instead, change to: 24 * 30 * 6
+        let lookback = 24 * 36;
+        let bars: &[MarketBar] = if all_bars.len() > lookback {
+            &all_bars[all_bars.len() - lookback..]
+        } else {
+            all_bars
+        };
+
+        let n = bars.len();
 
         let mut equity = self.initial_equity;
         let mut peak_equity = equity;
@@ -69,12 +87,12 @@ impl Backtester {
         let mut prev_forecast: Option<ForecastSnapshot> = None;
 
         // Warmup: need enough history for ML/GARCH/etc.
-        // We'll start at, say, idx = 500.
         let start_idx = 500;
 
         for i in 0..n {
             let price = bars[i].close;
-            // Mark-to-market equity if we hold a position:
+
+            // Mark-to-market equity if we hold a position.
             if current_pos != 0.0 {
                 let pos_value = current_pos * (price / entry_price - 1.0);
                 equity = (self.initial_equity * (1.0 + pos_value)).max(0.0);
@@ -89,7 +107,8 @@ impl Backtester {
             // Enforce max drawdown: once breached, close and stop trading.
             if dd >= self.max_drawdown_allowed && trading_enabled {
                 if current_pos != 0.0 {
-                    let pnl = current_pos * (price / entry_price - 1.0) * self.initial_equity;
+                    let pnl =
+                        current_pos * (price / entry_price - 1.0) * self.initial_equity;
                     trades.push(Trade {
                         entry_price,
                         exit_price: price,
@@ -130,14 +149,15 @@ impl Backtester {
             // If position changes, treat it as closing previous and opening new.
             if (new_pos - current_pos).abs() > 1e-6 {
                 if current_pos != 0.0 {
-                    let pnl = current_pos * (price / entry_price - 1.0) * self.initial_equity;
+                    let pnl =
+                        current_pos * (price / entry_price - 1.0) * self.initial_equity;
                     trades.push(Trade {
                         entry_price,
                         exit_price: price,
                         size: current_pos,
                         pnl,
                     });
-                    equity = equity + pnl; // adjust equity explicitly
+                    equity += pnl; // adjust equity explicitly
                     if equity > peak_equity {
                         peak_equity = equity;
                     }
@@ -157,14 +177,15 @@ impl Backtester {
         // Close any open position at final bar.
         if current_pos != 0.0 {
             let last_price = bars.last().unwrap().close;
-            let pnl = current_pos * (last_price / entry_price - 1.0) * self.initial_equity;
+            let pnl =
+                current_pos * (last_price / entry_price - 1.0) * self.initial_equity;
             trades.push(Trade {
                 entry_price,
                 exit_price: last_price,
                 size: current_pos,
                 pnl,
             });
-            equity = equity + pnl;
+            equity += pnl;
             equity_curve.push(equity);
         }
 
@@ -201,10 +222,27 @@ impl Backtester {
 fn build_forecast_for_slice(
     hist: &[MarketBar],
 ) -> (ForecastSnapshot, f64, f64, MarketRegime) {
+    // Returns + GARCH vol
     let returns = compute_log_returns(hist);
     let garch_vol = compute_garch_like_vol(&returns);
-    let (features, targets) = crate::features::build_ml_dataset(hist, &returns);
-    let (beta, ml_resid_std) = crate::features::fit_linear_regression_ensemble(
+
+    // ML features / targets
+    let (features, targets) = build_ml_dataset(hist, &returns);
+    if features.is_empty() {
+        let last_close = hist.last().unwrap().close;
+        let snap = ForecastSnapshot {
+            mean: last_close,
+            std: 0.0,
+            skew: 0.0,
+            kurtosis: 3.0,
+            mode: last_close,
+            band_lower: last_close,
+            band_upper: last_close,
+        };
+        return (snap, 0.0, 0.01, MarketRegime::SidewaysLowVol);
+    }
+
+    let (beta, ml_resid_std) = fit_linear_regression_ensemble(
         &features,
         &targets,
         1e-4,
@@ -213,7 +251,7 @@ fn build_forecast_for_slice(
     );
 
     let last_features = features.last().unwrap().clone();
-    let ml_pred_ret = crate::features::dot(&beta, &last_features);
+    let ml_pred_ret = dot(&last_features, &beta);
     let ml_pred_vol = if ml_resid_std > 0.0 { ml_resid_std } else { 0.01 };
 
     let ml_regime = classify_regime_ml(ml_pred_ret, ml_pred_vol, &returns);
@@ -231,17 +269,19 @@ fn build_forecast_for_slice(
     let sabr = estimate_sabr_params(&returns, base_sigma, last_close);
 
     // Small Monte Carlo to get distribution for next step.
-    let horizon = 4; // a few hours ahead
+    // NOTE: horizon = 1 here to stop SABR from nuking the grid.
+    let horizon = 1;
     let buckets = 80;
     let paths = 3000;
 
-    let heatmap = simulate_heatmap(hist, drift, base_sigma, &sabr, horizon, buckets, paths);
+    let sim = simulate_heatmap(hist, drift, base_sigma, &sabr, horizon, buckets, paths);
 
-    let (min_p, max_p) = compute_price_bounds(hist, last_close);
-    let row = &heatmap[0];
+    let min_p = sim.min_price;
+    let max_p = sim.max_price;
+    let row = &sim.heatmap[0];
 
     let (mean_price, std_price, skew, kurt, mode_price) =
-        summarize_distribution_extended(row, min_p, max_p);
+        summarize_distribution_from_row(row, min_p, max_p);
 
     let band_lower = mean_price - 1.96 * std_price;
     let band_upper = mean_price + 1.96 * std_price;
@@ -257,6 +297,53 @@ fn build_forecast_for_slice(
     };
 
     (snap, drift, base_sigma, ml_regime)
+}
+
+/// Summarize one discrete distribution over price grid.
+fn summarize_distribution_from_row(
+    row: &[f64],
+    min_p: f64,
+    max_p: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let buckets = row.len();
+    if buckets == 0 {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let width = (max_p - min_p) / buckets as f64;
+
+    // mean
+    let mut mean = 0.0;
+    for (i, &p) in row.iter().enumerate() {
+        let price = min_p + (i as f64 + 0.5) * width;
+        mean += price * p;
+    }
+
+    // central moments
+    let mut m2 = 0.0;
+    let mut m3 = 0.0;
+    let mut m4 = 0.0;
+    for (i, &p) in row.iter().enumerate() {
+        let price = min_p + (i as f64 + 0.5) * width;
+        let d = price - mean;
+        m2 += p * d.powi(2);
+        m3 += p * d.powi(3);
+        m4 += p * d.powi(4);
+    }
+
+    let std = m2.sqrt();
+    let skew = if std > 0.0 { m3 / std.powi(3) } else { 0.0 };
+    let kurt = if std > 0.0 { m4 / std.powi(4) } else { 0.0 };
+
+    // mode
+    let (mode_idx, _) = row
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .unwrap();
+    let mode = min_p + (mode_idx as f64 + 0.5) * width;
+
+    (mean, std, skew, kurt, mode)
 }
 
 fn compute_max_drawdown(equity_curve: &[f64]) -> f64 {
@@ -279,7 +366,7 @@ fn compute_max_drawdown(equity_curve: &[f64]) -> f64 {
 fn compute_stats(
     equity_curve: &[f64],
     trades: &[Trade],
-    years: f64,
+    _years: f64,
 ) -> (f64, f64) {
     let wins = trades.iter().filter(|t| t.pnl > 0.0).count();
     let total = trades.len().max(1);
