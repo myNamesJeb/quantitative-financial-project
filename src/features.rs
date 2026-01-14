@@ -76,13 +76,25 @@ pub fn build_ml_dataset(
     // Windows for "short" and "long" horizons.
     let vol_s = 5usize;
     let vol_l = 20usize;
+    let vol_z_window = 200usize;
 
-    // Basic volume/trades stats over the whole sample.
-    let volumes: Vec<f64> = bars.iter().map(|b| b.volume).collect();
-    let trades: Vec<f64> = bars.iter().map(|b| b.trades).collect();
-
-    let (vm, vstd) = mean_std(&volumes);
-    let (tm, tstd) = mean_std(&trades);
+    // Cumulative sums for rolling volume/trades stats.
+    let mut cum_vol = Vec::with_capacity(bars.len() + 1);
+    let mut cum_vol2 = Vec::with_capacity(bars.len() + 1);
+    let mut cum_tr = Vec::with_capacity(bars.len() + 1);
+    let mut cum_tr2 = Vec::with_capacity(bars.len() + 1);
+    cum_vol.push(0.0);
+    cum_vol2.push(0.0);
+    cum_tr.push(0.0);
+    cum_tr2.push(0.0);
+    for b in bars {
+        let v = b.volume;
+        let t = b.trades;
+        cum_vol.push(cum_vol.last().unwrap() + v);
+        cum_vol2.push(cum_vol2.last().unwrap() + v * v);
+        cum_tr.push(cum_tr.last().unwrap() + t);
+        cum_tr2.push(cum_tr2.last().unwrap() + t * t);
+    }
 
     let mut feats = Vec::new();
     let mut targs = Vec::new();
@@ -106,18 +118,23 @@ pub fn build_ml_dataset(
         let (_, vol5) = mean_std(r_s);
         let (_, vol20) = mean_std(r_l);
 
-        // Volume & trades z-scores at bar[end].
-        let vol_z = if vstd > 0.0 {
-            (bars[end].volume - vm) / vstd
-        } else {
-            0.0
-        };
+        // Volume & trades z-scores at bar[end] using rolling stats.
+        let z_start = end.saturating_sub(vol_z_window);
+        let z_len = (end - z_start).max(1) as f64;
 
-        let trades_z = if tstd > 0.0 {
-            (bars[end].trades - tm) / tstd
-        } else {
-            0.0
-        };
+        let vol_sum = cum_vol[end] - cum_vol[z_start];
+        let vol_sum2 = cum_vol2[end] - cum_vol2[z_start];
+        let vol_mean = vol_sum / z_len;
+        let vol_var = (vol_sum2 / z_len) - vol_mean * vol_mean;
+        let vol_std = vol_var.max(0.0).sqrt().max(1e-6);
+        let vol_z = (bars[end].volume - vol_mean) / vol_std;
+
+        let tr_sum = cum_tr[end] - cum_tr[z_start];
+        let tr_sum2 = cum_tr2[end] - cum_tr2[z_start];
+        let tr_mean = tr_sum / z_len;
+        let tr_var = (tr_sum2 / z_len) - tr_mean * tr_mean;
+        let tr_std = tr_var.max(0.0).sqrt().max(1e-6);
+        let trades_z = (bars[end].trades - tr_mean) / tr_std;
 
         // Relative intrabar range at bar[end].
         let range = if bars[end].close > 0.0 {
@@ -146,18 +163,44 @@ pub fn build_ml_dataset(
             }
         }
 
-        // Construct feature vector.
+        // Normalize some features by longer vol to stabilize scale.
+        let vol20_safe = vol20.max(1e-6);
+        let r_t_z = r_t / vol20_safe;
+        let r5_z = r5 / vol20_safe;
+        let r20_z = r20 / vol20_safe;
+        let vol_ratio = (vol5 / vol20_safe).clamp(0.1, 3.0);
+
+        // Clamp heavy tails to reduce outlier impact.
+        let clamp = |x: f64, lo: f64, hi: f64| x.clamp(lo, hi);
+
+        let r_t_z = clamp(r_t_z, -6.0, 6.0);
+        let r5_z = clamp(r5_z, -10.0, 10.0);
+        let r20_z = clamp(r20_z, -12.0, 12.0);
+        let vol5_c = clamp(vol5, 0.0, 0.2);
+        let vol20_c = clamp(vol20, 0.0, 0.2);
+        let vol_z_c = clamp(vol_z, -6.0, 6.0);
+        let trades_z_c = clamp(trades_z, -6.0, 6.0);
+        let range_c = clamp(range, 0.0, 0.2);
+        let run_len_c = clamp(run_len as f64, 0.0, 30.0);
+
+        // Construct feature vector with nonlinear terms.
         feats.push(vec![
-            1.0,                     // bias term
-            r_t,                     // current return
-            r5,                      // short-horizon cum return
-            r20,                     // long-horizon cum return
-            vol5,                    // short-horizon vol
-            vol20,                   // long-horizon vol
-            vol_z,                   // volume z-score
-            trades_z,                // trades z-score
-            range,                   // relative range
-            run_len as f64,          // trend run length
+            1.0,                         // bias term
+            r_t_z,                       // current return (z)
+            r5_z,                        // short-horizon cum return (z)
+            r20_z,                       // long-horizon cum return (z)
+            vol5_c,                      // short-horizon vol
+            vol20_c,                     // long-horizon vol
+            vol_ratio,                   // vol ratio
+            vol_z_c,                     // volume z-score
+            trades_z_c,                  // trades z-score
+            range_c,                     // relative range
+            run_len_c,                   // trend run length
+            r_t_z.abs(),                 // abs return
+            r_t_z * r_t_z,               // squared return
+            r_t_z * vol5_c,              // return-vol interaction
+            r5_z * vol_ratio,            // momentum-vol interaction
+            range_c * vol_z_c,           // range/volume interaction
         ]);
 
         // One-step-ahead target.
@@ -165,6 +208,25 @@ pub fn build_ml_dataset(
     }
 
     (feats, targs)
+}
+
+/// Same as build_ml_dataset but keeps the time index for walk-forward CV.
+pub fn build_ml_dataset_indexed(
+    bars: &[MarketBar],
+    returns: &[f64],
+) -> (Vec<(usize, Vec<f64>)>, Vec<f64>) {
+    let (feats, targs) = build_ml_dataset(bars, returns);
+    let n = returns.len();
+    if n < 40 || bars.len() <= n {
+        return (vec![], vec![]);
+    }
+    let start = 20usize; // matches build_ml_dataset's long window
+    let mut out = Vec::with_capacity(feats.len());
+    for (i, f) in feats.into_iter().enumerate() {
+        let t = start + i;
+        out.push((t, f));
+    }
+    (out, targs)
 }
 
 /// Mean of a slice.

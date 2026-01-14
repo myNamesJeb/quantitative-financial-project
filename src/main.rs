@@ -1,7 +1,11 @@
 
+// src/main.rs
+
 use std::error::Error;
+use std::collections::HashSet;
 
 mod advanced;
+mod config;
 mod data;
 mod features;
 mod ml;
@@ -11,9 +15,14 @@ mod simulate;
 mod viz;
 mod backtest;
 mod strategy;
+mod logger;
+mod research;
 
 use data::read_bars;
 use backtest::Backtester;
+use config::RunConfig;
+use logger::append_run_summary;
+use research::walk_forward_cv;
 
 // For multi-threaded, multi-timeframe summaries
 use rayon::join;
@@ -21,6 +30,7 @@ use rayon::join;
 use crate::data::MarketBar;
 use crate::features::{compute_log_returns, compute_garch_like_vol, mean_std};
 use crate::ml::classify_regime_ml;
+use crate::ml::{fit_mlp, fit_stump, predict_mlp, predict_stump};
 use crate::drift::compute_drift_and_vol_scale;
 use crate::sabr::estimate_sabr_params;
 use crate::simulate::simulate_heatmap;
@@ -76,23 +86,62 @@ fn compute_tf_summary(name: &'static str, bars: &[MarketBar]) -> TFSummary {
     }
 }
 
+fn physical_core_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/cpuinfo") {
+            let mut cores = HashSet::new();
+            let mut phys_id: Option<String> = None;
+            let mut core_id: Option<String> = None;
+
+            for line in contents.lines() {
+                if let Some(v) = line.strip_prefix("physical id") {
+                    phys_id = v.split(':').nth(1).map(|s| s.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("core id") {
+                    core_id = v.split(':').nth(1).map(|s| s.trim().to_string());
+                }
+
+                if let (Some(p), Some(c)) = (phys_id.take(), core_id.take()) {
+                    cores.insert((p, c));
+                }
+            }
+
+            if !cores.is_empty() {
+                return Some(cores.len());
+            }
+        }
+    }
+
+    None
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let threads = physical_core_count()
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <output.png>", args[0]);
+    if args.len() < 2 || args.len() > 3 {
+        eprintln!("Usage: {} <output.png> [config.json]", args[0]);
         std::process::exit(1);
     }
     let output_png = &args[1];
+    let cfg_path = args.get(2).map(|s| s.as_str()).unwrap_or("config.json");
+    let cfg = RunConfig::load(cfg_path);
 
     // ------------------------------------------------------
     // 1) Load multiple timeframes
     // ------------------------------------------------------
-    let one_d = read_bars("archive/sol_1d_data_2020_to_2025.csv")?;
+    let mut one_d = read_bars("archive/sol_1d_data_2020_to_2025.csv")?;
     let mut four_h = read_bars("archive/sol_4h_data_2020_to_2025.csv")?;
     let mut one_h = read_bars("archive/sol_1h_data_2020_to_2025.csv")?;
     let mut f15 = read_bars("archive/sol_15m_data_2020_to_2025.csv")?;
 
-    // Sort intraday TFs by time just in case
+    // Sort by time just in case
+    one_d.sort_by(|a, b| a.unix.cmp(&b.unix));
     four_h.sort_by(|a, b| a.unix.cmp(&b.unix));
     one_h.sort_by(|a, b| a.unix.cmp(&b.unix));
     f15.sort_by(|a, b| a.unix.cmp(&b.unix));
@@ -104,13 +153,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  15m = {}", f15.len());
 
     // ------------------------------------------------------
-    // 2) Run Backtester on the 1H timeframe with StrategyRouter
+    // 2) Run Backtester on the 1H timeframe with multi-TF context
     // ------------------------------------------------------
     let mut bt = Backtester::default();
     bt.initial_equity = 1_000.0;
     bt.max_drawdown_allowed = 0.30;
+    bt.apply_config(&cfg);
 
-    let results = bt.run(&one_h);
+    let results = bt.run(&one_h, &one_d, &four_h, &f15);
 
     println!("\n=========== BACKTEST SUMMARY ===========");
     println!("Initial equity: {:.2}", bt.initial_equity);
@@ -118,8 +168,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Total return:   {:.2}%", results.total_return * 100.0);
     println!("Trades:         {}", results.trades.len());
     println!("Max drawdown:   {:.2}%", results.max_drawdown * 100.0);
+    println!("Stress DD -5%:  {:.2}%", results.stress_dd_5 * 100.0);
+    println!("Stress DD -10%: {:.2}%", results.stress_dd_10 * 100.0);
     println!("Sharpe (ann.):  {:.2}", results.sharpe);
+    println!(
+        "Accuracy (avg): brier {:.6}, log {:.6}, quantile {:.6}",
+        results.accuracy.avg_brier,
+        results.accuracy.avg_log_loss,
+        results.accuracy.avg_quantile_error
+    );
+    println!("Accuracy best:  {:?}", results.accuracy.best_metric);
     println!("========================================\n");
+
+    if let Err(err) = append_run_summary(&cfg.log_path, &results) {
+        eprintln!("Logging failed: {}", err);
+    }
+
+    if std::env::var("RUN_CV").ok().as_deref() == Some("1") {
+        let cv = walk_forward_cv(&one_h, 1000, 200, 20, cfg.embargo_bars);
+        if !cv.mse.is_empty() {
+            let avg_mse: f64 = cv.mse.iter().sum::<f64>() / cv.mse.len() as f64;
+            println!("Walk-forward CV MSE (avg): {:.8}", avg_mse);
+        } else {
+            println!("Walk-forward CV skipped (insufficient data).");
+        }
+    }
 
     // ------------------------------------------------------
     // 3) Multi-timeframe forecast engine for most recent bar
@@ -153,7 +226,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let last_x = features_x.last().unwrap();
-    let ml_pred_ret_1h = ml::dot(last_x, &beta_1h);
+    let lin_pred = ml::dot(last_x, &beta_1h);
+    let stump = fit_stump(&features_x, &targets_y);
+    let stump_pred = stump
+        .as_ref()
+        .map(|s| predict_stump(s, last_x))
+        .unwrap_or(0.0);
+    let mlp = fit_mlp(&features_x, &targets_y, 8, 3, 0.005);
+    let mlp_pred = mlp
+        .as_ref()
+        .map(|m| predict_mlp(m, last_x))
+        .unwrap_or(0.0);
+
+    let ml_pred_ret_1h = 0.6 * lin_pred + 0.25 * stump_pred + 0.15 * mlp_pred;
     let ml_pred_vol_1h = if ml_resid_std_1h > 0.0 {
         ml_resid_std_1h
     } else {
@@ -180,11 +265,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("1H base sigma = {:.6}", base_sigma_1h);
 
     // ---------- Multi-timeframe summaries (parallel over 1D, 4H, 15m) ----------
-    //
-    // We use 4 threads total:
-    //  - main thread: 1H ML (already done)
-    //  - 3 worker tasks: 1D, 4H, 15m summaries
-    //
     let (tf_1d, (tf_4h, tf_15m)) = join(
         || compute_tf_summary("1D", &one_d),
         || {
@@ -216,13 +296,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // ---------- Fuse the 4 timeframes ----------
-    //
-    // Weighting:
-    //  - 1D  : slow macro drift anchor
-    //  - 4H  : swing trend
-    //  - 1H  : main trading TF (ML)
-    //  - 15m : microstructure / short-term flow
-    //
     let w_1d = 0.35;
     let w_4h = 0.30;
     let w_1h = 0.25;
@@ -261,9 +334,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         drift_fused,
         sigma_fused,
         &sabr_params,
-        50,      // horizon
-        80,      // buckets
-        3_000,   // paths
+        cfg.forecast_horizon,
+        cfg.buckets,
+        cfg.paths,
     );
 
     print_bucket_summary(&sim.heatmap, sim.min_price, sim.max_price, bars_1h);

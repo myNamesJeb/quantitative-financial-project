@@ -2,6 +2,8 @@
 // src/ml.rs
 
 use rand::Rng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 
 use crate::features::mean_std;
 use crate::advanced::{hmm_infer_state, VolState};
@@ -16,9 +18,205 @@ pub enum MarketRegime {
     SidewaysHighVol,
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct Stump {
+    pub feature_idx: usize,
+    pub threshold: f64,
+    pub left_mean: f64,
+    pub right_mean: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mlp {
+    pub w1: Vec<Vec<f64>>,
+    pub b1: Vec<f64>,
+    pub w2: Vec<f64>,
+    pub b2: f64,
+}
+
 /// Simple dot product helper.
 pub fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Fit a 1-level regression stump (tree-like).
+pub fn fit_stump(features: &[Vec<f64>], targets: &[f64]) -> Option<Stump> {
+    let n = features.len();
+    if n == 0 {
+        return None;
+    }
+    let d = features[0].len();
+    if d == 0 || targets.len() != n {
+        return None;
+    }
+
+    let mut best = None;
+    let mut best_mse = f64::INFINITY;
+
+    for j in 0..d {
+        let mut vals: Vec<(f64, f64)> = features
+            .iter()
+            .zip(targets.iter())
+            .map(|(x, y)| (x[j], *y))
+            .collect();
+        vals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        if vals.len() < 2 {
+            continue;
+        }
+
+        let mid = vals.len() / 2;
+        let threshold = (vals[mid - 1].0 + vals[mid].0) * 0.5;
+
+        let mut left_sum = 0.0;
+        let mut left_n = 0.0;
+        let mut right_sum = 0.0;
+        let mut right_n = 0.0;
+
+        for &(v, y) in &vals {
+            if v <= threshold {
+                left_sum += y;
+                left_n += 1.0;
+            } else {
+                right_sum += y;
+                right_n += 1.0;
+            }
+        }
+
+        if left_n < 2.0 || right_n < 2.0 {
+            continue;
+        }
+
+        let left_mean = left_sum / left_n;
+        let right_mean = right_sum / right_n;
+
+        let mut mse = 0.0;
+        for &(v, y) in &vals {
+            let pred = if v <= threshold { left_mean } else { right_mean };
+            let err = y - pred;
+            mse += err * err;
+        }
+        mse /= vals.len() as f64;
+
+        if mse < best_mse {
+            best_mse = mse;
+            best = Some(Stump {
+                feature_idx: j,
+                threshold,
+                left_mean,
+                right_mean,
+            });
+        }
+    }
+
+    best
+}
+
+pub fn predict_stump(stump: &Stump, x: &[f64]) -> f64 {
+    if x.is_empty() || stump.feature_idx >= x.len() {
+        return 0.0;
+    }
+    if x[stump.feature_idx] <= stump.threshold {
+        stump.left_mean
+    } else {
+        stump.right_mean
+    }
+}
+
+pub fn fit_mlp(
+    features: &[Vec<f64>],
+    targets: &[f64],
+    hidden: usize,
+    epochs: usize,
+    lr: f64,
+) -> Option<Mlp> {
+    let n = features.len();
+    if n == 0 || targets.len() != n {
+        return None;
+    }
+    let d = features[0].len();
+    if d == 0 || hidden == 0 {
+        return None;
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+    let mut w1 = vec![vec![0.0; d]; hidden];
+    let mut b1 = vec![0.0; hidden];
+    let mut w2 = vec![0.0; hidden];
+    let mut b2 = 0.0;
+
+    for i in 0..hidden {
+        for j in 0..d {
+            w1[i][j] = rng.gen_range(-0.1..0.1);
+        }
+        w2[i] = rng.gen_range(-0.1..0.1);
+    }
+
+    let mut idxs: Vec<usize> = (0..n).collect();
+    let lr = lr.max(1e-6);
+
+    for _ in 0..epochs {
+        idxs.shuffle(&mut rng);
+        for &idx in &idxs {
+            let x = &features[idx];
+            let y = targets[idx];
+
+            let mut h = vec![0.0; hidden];
+            for i in 0..hidden {
+                let mut z = b1[i];
+                for j in 0..d {
+                    z += w1[i][j] * x[j];
+                }
+                h[i] = z.tanh();
+            }
+
+            let mut y_hat = b2;
+            for i in 0..hidden {
+                y_hat += w2[i] * h[i];
+            }
+
+            let err = y_hat - y;
+
+            // Gradients for output layer
+            for i in 0..hidden {
+                let grad = err * h[i];
+                w2[i] -= lr * grad;
+            }
+            b2 -= lr * err;
+
+            // Gradients for hidden layer
+            for i in 0..hidden {
+                let dh = err * w2[i];
+                let dz = dh * (1.0 - h[i] * h[i]);
+                b1[i] -= lr * dz;
+                for j in 0..d {
+                    w1[i][j] -= lr * dz * x[j];
+                }
+            }
+        }
+    }
+
+    Some(Mlp { w1, b1, w2, b2 })
+}
+
+pub fn predict_mlp(mlp: &Mlp, x: &[f64]) -> f64 {
+    let hidden = mlp.w1.len();
+    if hidden == 0 {
+        return mlp.b2;
+    }
+    let d = x.len();
+    let mut h = vec![0.0; hidden];
+    for i in 0..hidden {
+        let mut z = mlp.b1[i];
+        for j in 0..d {
+            z += mlp.w1[i][j] * x[j];
+        }
+        h[i] = z.tanh();
+    }
+    let mut y_hat = mlp.b2;
+    for i in 0..hidden {
+        y_hat += mlp.w2[i] * h[i];
+    }
+    y_hat
 }
 
 /// Classify the current regime using:
@@ -220,6 +418,7 @@ pub fn fit_linear_regression_ensemble(
     }
 
     let mut rng = rand::thread_rng();
+    let feature_frac = 0.75f64;
 
     let mut beta_sum = vec![0.0; d];
     let mut rss_total = 0.0;
@@ -229,8 +428,13 @@ pub fn fit_linear_regression_ensemble(
     for _ in 0..nm {
         let m = ((n as f64 * sample_frac).round() as usize).clamp(d + 1, n);
 
-        let mut xtx = vec![vec![0.0; d]; d];
-        let mut xty = vec![0.0; d];
+        let k = ((d as f64 * feature_frac).round() as usize).clamp(1, d);
+        let mut feat_idx: Vec<usize> = (0..d).collect();
+        feat_idx.shuffle(&mut rng);
+        feat_idx.truncate(k);
+
+        let mut xtx = vec![vec![0.0; k]; k];
+        let mut xty = vec![0.0; k];
 
         // Sample with replacement for bagging.
         for _ in 0..m {
@@ -238,16 +442,16 @@ pub fn fit_linear_regression_ensemble(
             let x = &features[idx];
             let y = targets[idx];
 
-            for i in 0..d {
-                xty[i] += x[i] * y;
-                for j in 0..d {
-                    xtx[i][j] += x[i] * x[j];
+            for (ii, &i) in feat_idx.iter().enumerate() {
+                xty[ii] += x[i] * y;
+                for (jj, &j) in feat_idx.iter().enumerate() {
+                    xtx[ii][jj] += x[i] * x[j];
                 }
             }
         }
 
         // Ridge penalty on diagonal.
-        for i in 0..d {
+        for i in 0..k {
             xtx[i][i] += lambda;
         }
 
@@ -255,14 +459,19 @@ pub fn fit_linear_regression_ensemble(
         let mut xty_clone = xty.clone();
         let beta = solve_linear_system(&mut xtx_clone, &mut xty_clone);
 
+        let mut beta_full = vec![0.0; d];
+        for (ii, &i) in feat_idx.iter().enumerate() {
+            beta_full[i] = beta[ii];
+        }
+
         for j in 0..d {
-            beta_sum[j] += beta[j];
+            beta_sum[j] += beta_full[j];
         }
 
         // Model residuals across the FULL dataset (not just the subsample).
         let mut rss = 0.0;
         for (x, y) in features.iter().zip(targets.iter()) {
-            let y_hat = dot(&beta, x);
+            let y_hat = dot(&beta_full, x);
             rss += (y - y_hat).powi(2);
         }
         rss_total += rss;

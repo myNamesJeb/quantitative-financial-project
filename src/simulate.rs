@@ -2,7 +2,9 @@
 // src/simulate.rs
 
 use rand::Rng;
+use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 
 use crate::data::MarketBar;
 use crate::sabr::{SabrParams, sabr_implied_vol};
@@ -101,6 +103,13 @@ pub fn simulate_heatmap(
     paths: usize,
 ) -> SimulationResult {
     let last_close = bars.last().unwrap().close;
+    if horizon == 0 || buckets == 0 || paths == 0 {
+        return SimulationResult {
+            heatmap: Vec::new(),
+            min_price: last_close,
+            max_price: last_close,
+        };
+    }
 
     // Compute log-returns for volatility clustering diagnostics.
     let returns = compute_log_returns(bars);
@@ -151,12 +160,8 @@ pub fn simulate_heatmap(
         base_sigma *= 0.85;
     }
 
-    let mut rng = rand::thread_rng();
     let normal = Normal::new(0.0, 1.0).unwrap();
-
-    // Store all simulated prices for rebucketing later:
-    // prices[t][path]
-    let mut prices = vec![vec![0.0; paths]; horizon];
+    let seed: u64 = rand::random();
 
     // Per-step drift (log scale) – keep it mild across the horizon.
     let drift_step = drift / horizon as f64;
@@ -164,37 +169,55 @@ pub fn simulate_heatmap(
     // Vol clustering scale factor used inside the simulation.
     let vol_cluster_scale = 1.0 + 0.5 * vol_cluster;
 
-    for path in 0..paths {
-        let mut price = last_close;
+    // Simulate each path in parallel, then transpose.
+    let prices_by_path: Vec<Vec<f64>> = (0..paths)
+        .into_par_iter()
+        .map(|path| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(
+                seed ^ (path as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            let mut price = last_close;
+            let mut out = Vec::with_capacity(horizon);
 
+            for _ in 0..horizon {
+                // SABR local vol: use F = K = price (ATM smile at current level)
+                let sabr_vol = sabr_implied_vol(price, price, sabr);
+                let smile_scale = (sabr_vol / sabr.atm_vol.max(1e-6)).clamp(0.5, 1.8);
+
+                // Stochastic vol shock
+                let vol_shock: f64 = normal.sample(&mut rng);
+
+                let local_sigma_raw =
+                    base_sigma * smile_scale * vol_cluster_scale * (1.0 + 0.15 * vol_shock);
+                let local_sigma = local_sigma_raw.clamp(0.002, 0.06);
+
+                let z: f64 = normal.sample(&mut rng);
+                price *= (drift_step + local_sigma * z).exp();
+
+                // Liquidity-sensitive jump process: rare but meaningful.
+                if rng.gen_bool(jump_prob) {
+                    let jump_z: f64 = normal.sample(&mut rng);
+                    let jump_scale = 0.15 + 0.30 * vol_cluster; // 15–45% of local_sigma
+                    price *= (jump_scale * local_sigma * jump_z).exp();
+                }
+
+                if !price.is_finite() || price <= 0.0 {
+                    // If something explodes, reset to last_close (very rare).
+                    price = last_close;
+                }
+
+                out.push(price);
+            }
+
+            out
+        })
+        .collect();
+
+    // Transpose into prices[t][path] for downstream logic.
+    let mut prices = vec![vec![0.0; paths]; horizon];
+    for (p, path_prices) in prices_by_path.iter().enumerate() {
         for t in 0..horizon {
-            // SABR local vol: use F = K = price (ATM smile at current level)
-            let sabr_vol = sabr_implied_vol(price, price, sabr);
-            let smile_scale = (sabr_vol / sabr.atm_vol.max(1e-6)).clamp(0.5, 1.8);
-
-            // Stochastic vol shock
-            let vol_shock: f64 = normal.sample(&mut rng);
-
-            let local_sigma_raw =
-                base_sigma * smile_scale * vol_cluster_scale * (1.0 + 0.15 * vol_shock);
-            let local_sigma = local_sigma_raw.clamp(0.002, 0.06);
-
-            let z: f64 = normal.sample(&mut rng);
-            price *= (drift_step + local_sigma * z).exp();
-
-            // Liquidity-sensitive jump process: rare but meaningful.
-            if rng.gen_bool(jump_prob) {
-                let jump_z: f64 = normal.sample(&mut rng);
-                let jump_scale = 0.15 + 0.30 * vol_cluster; // 15–45% of local_sigma
-                price *= (jump_scale * local_sigma * jump_z).exp();
-            }
-
-            if !price.is_finite() || price <= 0.0 {
-                // If something explodes, reset to last_close (very rare).
-                price = last_close;
-            }
-
-            prices[t][path] = price;
+            prices[t][p] = path_prices[t];
         }
     }
 

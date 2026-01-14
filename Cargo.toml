@@ -11,3 +11,5 @@ rand_distr = "0.4"
 image = "0.24"
 chrono = "0.4.42"
 rayon = "1.11.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
